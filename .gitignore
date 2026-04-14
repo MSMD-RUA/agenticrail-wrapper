@@ -1,0 +1,23 @@
+# env
+.env
+.env.*
+*.env
+
+# node
+node_modules/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# system
+.DS_Store
+Thumbs.db
+
+# wrangler / cloudflare
+.wrangler/
+
+# build
+dist/
+build/

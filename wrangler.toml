@@ -1,0 +1,14 @@
+﻿name = "agenticrail-wrapper"
+main = "src/index.ts"
+compatibility_date = "2026-04-13"
+
+[vars]
+RAIL_URL = "https://slp8-gate.o1ooo1.workers.dev/evaluate"
+# Optional fallback only during transition.
+# Remove this once DB-backed API keys are fully live.
+WRAPPER_SHARED_SECRET = "replace_me"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "agenticrail_wrapper_db"
+database_id = "PASTE_DB_ID_HERE"
