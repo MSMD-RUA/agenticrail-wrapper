@@ -1,14 +1,23 @@
 ﻿name = "agenticrail-wrapper"
 main = "src/index.ts"
-compatibility_date = "2026-04-13"
+compatibility_date = "2026-04-17"
 
 [vars]
-RAIL_URL = "https://slp8-gate.o1ooo1.workers.dev/evaluate"
-# Optional fallback only during transition.
-# Remove this once DB-backed API keys are fully live.
-WRAPPER_SHARED_SECRET = "replace_me"
+DEMO_KEY = "DEMO-AGENTICRAIL-PUBLIC-2026"
+
+[[services]]
+binding = "RAIL"
+service = "slp8-gate"
+environment = "production"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "agenticrail_wrapper_db"
-database_id = "PASTE_DB_ID_HERE"
+database_id = "244d3faa-dee5-4089-b951-82299e98811b"
+
+[durable_objects]
+bindings = [{ name = "RATE_LIMITER", class_name = "RateLimiter" }]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RateLimiter"]

@@ -1,12 +1,55 @@
 export interface Env {
-  RAIL_URL: string;
+  RAIL: Fetcher;
   RAIL_PUBLIC_KEY?: string;
-  WRAPPER_SHARED_SECRET?: string; // optional fallback during transition
+  RAIL_SHARED_SECRET?: string;
+  DEMO_KEY?: string;
   DB: D1Database;
+  RATE_LIMITER: DurableObjectNamespace;
 }
 
-const FALLBACK_CLIENT_ID = "__fallback_shared_secret__";
-const FALLBACK_KEY_ID = "__fallback_shared_secret__";
+// ── Global Durable Object rate limiter ───────────────────────────────────────
+// One DO instance per rate-limit key (e.g. "demo:1.2.3.4", "prod:key_abc").
+// Single-threaded per-instance: no races, truly global across Workers instances.
+export class RateLimiter {
+  private count = 0;
+  private windowStart = 0;
+
+  constructor(_state: DurableObjectState) {}
+
+  async fetch(req: Request): Promise<Response> {
+    const { limitPerMin } = await req.json<{ limitPerMin: number }>();
+    const now = Date.now();
+    if (!this.windowStart || now - this.windowStart > 60_000) {
+      this.count = 1;
+      this.windowStart = now;
+      return Response.json({ ok: true });
+    }
+    if (this.count >= limitPerMin) return Response.json({ ok: false });
+    this.count++;
+    return Response.json({ ok: true });
+  }
+}
+
+async function rateLimitOk(ns: DurableObjectNamespace, key: string, limitPerMin: number): Promise<boolean> {
+  try {
+    const id = ns.idFromName(key);
+    const stub = ns.get(id);
+    const res = await stub.fetch('https://rl.internal/check', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ limitPerMin }),
+    });
+    const data = await res.json<{ ok: boolean }>();
+    return data.ok;
+  } catch {
+    // If DO is unavailable, fail open (don't block traffic on rate-limiter outage)
+    return true;
+  }
+}
+
+// Convenience wrappers
+async function demoRateLimitOk(ns: DurableObjectNamespace, ip: string): Promise<boolean>    { return rateLimitOk(ns, `demo:${ip}`, 60); }
+async function prodRateLimitOk(ns: DurableObjectNamespace, keyId: string): Promise<boolean> { return rateLimitOk(ns, `prod:${keyId}`, 300); }
 
 type ExternalEvaluateRequest = {
   sequence_id: string;
@@ -57,6 +100,8 @@ type ExecutorResult = {
   status: "submitted" | "skipped" | "failed";
   message?: string;
   data?: Record<string, unknown>;
+  exec_id?: string;
+  idempotent?: boolean;
 };
 
 type ApiKeyRecord = {
@@ -85,6 +130,18 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "POST, GET, OPTIONS",
+          "access-control-allow-headers": "content-type, authorization",
+          "access-control-max-age": "86400",
+        },
+      });
+    }
+
     if (request.method === "GET" && url.pathname === "/v1/health") {
       return jsonResponse(200, {
         ok: true,
@@ -105,7 +162,17 @@ export default {
           });
         }
 
-        const authResult = await authenticateApiKey(token, env);
+        // Demo key bypass — no D1 lookup, fixed auth result
+        let authResult: AuthSuccess | AuthFailure;
+        if (env.DEMO_KEY && token === env.DEMO_KEY) {
+          const ip = request.headers.get("cf-connecting-ip") || "demo";
+          if (env.RATE_LIMITER && !await demoRateLimitOk(env.RATE_LIMITER, ip)) {
+            return jsonResponse(429, { error: "rate_limited", message: "Demo limit: 60 req/min per IP" });
+          }
+          authResult = { ok: true, keyId: "key_demo", clientId: "demo" };
+        } else {
+          authResult = await authenticateApiKey(token, env);
+        }
         if (!authResult.ok) {
           return jsonResponse(authResult.status, {
             error: authResult.error,
@@ -113,7 +180,13 @@ export default {
           });
         }
 
-        const parsedBody = await parseJsonBody<Partial<ExternalEvaluateRequest>>(request);
+        // Production key rate limit (300 req/min per key_id — globally enforced via DO)
+        if (authResult.clientId !== "demo" && env.RATE_LIMITER && !await prodRateLimitOk(env.RATE_LIMITER, authResult.keyId)) {
+          return jsonResponse(429, { error: "rate_limited", message: "Rate limit: 300 req/min per key" });
+        }
+
+        const parsedBody =
+          await parseJsonBody<Partial<ExternalEvaluateRequest>>(request);
         if (!parsedBody.ok) {
           return jsonResponse(400, {
             error: "invalid_json",
@@ -132,9 +205,26 @@ export default {
 
         const ext = normalizeExternalRequest(body as ExternalEvaluateRequest);
 
+        // Demo isolation: ensure sequence_id has demo- prefix
+        const isDemo = authResult.clientId === "demo";
+        if (isDemo && !ext.sequence_id.startsWith("demo-")) {
+          ext.sequence_id = "demo-" + ext.sequence_id;
+        }
+
+        // DO isolation: prefix model_id by spine so that Hokianga and MSMD
+        // sequences never share a Durable Object even when they share a client_id.
+        // "settle" exists in both spines — detectSpine() returns "msmd" for it,
+        // which is correct: a settle step in a Hokianga sequence will have arrived
+        // here after earlier Hokianga steps already stamped the hokianga: prefix.
+        // The DO isolation key is model_id::sequence_id, so the prefix is sticky
+        // only for the first step. Subsequent steps must use the same sequence_id
+        // to hit the same DO — which they will, by the enforcement contract.
+        const spine = detectSpine(ext.step);
+        const modelIdPrefix = spine === "hokianga" ? "hokianga" : "client";
+
         const railPayload: RailRequest = {
           schema_version: "1.0",
-          model_id: `client:${authResult.clientId}`,
+          model_id: `${modelIdPrefix}:${authResult.clientId}`,
           sequence_id: ext.sequence_id,
           step: ext.step,
           function: ext.function ?? ext.step,
@@ -145,22 +235,37 @@ export default {
           inputs: ext.inputs ?? {},
         };
 
-        const railRes = await fetch(env.RAIL_URL, {
+        const railHeaders: Record<string, string> = {
+          "content-type": "application/json",
+        };
+
+        // Demo mode: use gate's demo key so gate skips its response cache.
+        // This ensures replay scenarios reach the Durable Object nonce check.
+        const railKey = isDemo ? (env.DEMO_KEY || "") : (env.RAIL_SHARED_SECRET || "");
+        if (railKey) railHeaders["x-slp8-key"] = railKey;
+
+        const railRes = await env.RAIL.fetch("https://rail.internal/evaluate", {
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-          },
+          headers: railHeaders,
           body: JSON.stringify(railPayload),
         });
 
-        const rawRailJson = await safeJson<unknown>(railRes);
+        const railText = await railRes.text();
+        let rawRailJson: unknown = null;
+
+        try {
+          rawRailJson = railText ? JSON.parse(railText) : null;
+        } catch {
+          rawRailJson = null;
+        }
+
         const railJson = parseRailResponse(rawRailJson);
 
         if (!railRes.ok || !railJson) {
+          console.warn("rail_unavailable", { status: railRes.status, body: typeof rawRailJson === "string" ? rawRailJson.slice(0, 200) : rawRailJson });
           return jsonResponse(502, {
             error: "rail_unavailable",
             message: "Rail did not return a valid response",
-            rail_status: railRes.status,
           });
         }
 
@@ -168,11 +273,15 @@ export default {
           if (!railJson.signature) {
             return jsonResponse(502, {
               error: "rail_signature_missing",
-              message: "RAIL_PUBLIC_KEY is configured but rail returned no signature",
+              message:
+                "RAIL_PUBLIC_KEY is configured but rail returned no signature",
             });
           }
 
-          const verified = await verifyRailReceipt(env.RAIL_PUBLIC_KEY, railJson);
+          const verified = await verifyRailReceipt(
+            env.RAIL_PUBLIC_KEY,
+            railJson,
+          );
           if (!verified) {
             return jsonResponse(502, {
               error: "rail_signature_invalid",
@@ -193,12 +302,13 @@ export default {
 
         if (
           railJson.decision === "ALLOW" &&
-          (
-            returnedFunction !== expectedFunction ||
-            returnedAction !== expectedAction ||
-            returnedSequenceId !== expectedSequenceId ||
-            returnedStep !== expectedStep
-          )
+          ((returnedFunction !== undefined &&
+            returnedFunction !== expectedFunction) ||
+            (returnedAction !== undefined &&
+              returnedAction !== expectedAction) ||
+            (returnedSequenceId !== undefined &&
+              returnedSequenceId !== expectedSequenceId) ||
+            (returnedStep !== undefined && returnedStep !== expectedStep))
         ) {
           return jsonResponse(502, {
             error: "rail_meta_mismatch",
@@ -220,10 +330,9 @@ export default {
 
         if (
           railJson.decision !== "ALLOW" &&
-          (
-            returnedSequenceId !== expectedSequenceId ||
-            returnedStep !== expectedStep
-          )
+          ((returnedSequenceId !== undefined &&
+            returnedSequenceId !== expectedSequenceId) ||
+            (returnedStep !== undefined && returnedStep !== expectedStep))
         ) {
           console.warn("rail_meta_mismatch_on_non_allow", {
             expected: {
@@ -244,7 +353,7 @@ export default {
         };
 
         if (railJson.decision === "ALLOW") {
-          executorResult = await runExecutor(railPayload);
+          executorResult = await runExecutor(railPayload, railJson.pack_id ?? "", env);
         }
 
         const wrapperExecuted = executorResult.status === "submitted";
@@ -261,6 +370,7 @@ export default {
         return jsonResponse(200, {
           decision: railJson.decision,
           executed: wrapperExecuted,
+          pack_id: railJson.pack_id ?? null,
           reasons: Array.isArray(railJson.reasons) ? railJson.reasons : [],
           sequence_id: railPayload.sequence_id,
           step: railPayload.step,
@@ -304,14 +414,6 @@ async function authenticateApiKey(
   token: string,
   env: Env,
 ): Promise<AuthSuccess | AuthFailure> {
-  if (env.WRAPPER_SHARED_SECRET && token === env.WRAPPER_SHARED_SECRET) {
-    return {
-      ok: true,
-      keyId: FALLBACK_KEY_ID,
-      clientId: FALLBACK_CLIENT_ID,
-    };
-  }
-
   const keyParts = splitPresentedApiKey(token);
   if (!keyParts) {
     return {
@@ -407,9 +509,7 @@ function getBearerToken(authHeader: string): string | null {
   return m ? m[1].trim() : null;
 }
 
-function splitPresentedApiKey(
-  fullKey: string,
-): { prefix: string } | null {
+function splitPresentedApiKey(fullKey: string): { prefix: string } | null {
   const dotIndex = fullKey.indexOf(".");
   if (dotIndex <= 0) return null;
   if (dotIndex !== fullKey.lastIndexOf(".")) return null;
@@ -505,64 +605,238 @@ function isNonEmptyString(value: unknown): value is string {
 function parseRailResponse(value: unknown): RailResponse | null {
   if (!isPlainObject(value)) return null;
 
-  const decision = value.decision;
-  if (decision !== "ALLOW" && decision !== "DENY" && decision !== "HALT") {
-    return null;
-  }
+  // Check for new rail response shape: { status: "OK", pack: { ... }, pack_id: ... }
+  let rawDecision: unknown;
+  let reasons: string[] | undefined;
+  let executed: boolean | undefined;
+  let meta: RailResponse["meta"] | undefined;
+  let pack_id: string | undefined;
+  let key_id: string | undefined;
+  let signature: string | undefined;
+  let signature_alg: string | undefined;
+  let payload_hash: string | undefined;
+  let prev_receipt_id: string | undefined;
+  let ts_ms: number | undefined;
+  let version: string | undefined;
 
-  if (value.reasons !== undefined) {
-    if (!Array.isArray(value.reasons) || value.reasons.some((v) => typeof v !== "string")) {
-      return null;
+  if (value.status === "OK" && isPlainObject(value.pack)) {
+    // New shape
+    const pack = value.pack;
+    rawDecision = pack.decision;
+    // decision validation will happen later
+
+    if (pack.reasons !== undefined) {
+      if (
+        !Array.isArray(pack.reasons) ||
+        pack.reasons.some((v) => typeof v !== "string")
+      ) {
+        return null;
+      }
+      reasons = pack.reasons;
     }
-  }
 
-  if (value.meta !== undefined) {
-    if (!isPlainObject(value.meta)) return null;
+    if (pack.executed !== undefined) {
+      if (typeof pack.executed !== "boolean") return null;
+      executed = pack.executed;
+    }
 
-    const metaFields = ["action_type", "function", "model_id", "sequence_id", "step"];
-    for (const field of metaFields) {
-      const fieldValue = value.meta[field];
+    if (pack.meta !== undefined) {
+      if (!isPlainObject(pack.meta)) return null;
+
+      const metaFields = [
+        "action_type",
+        "function",
+        "model_id",
+        "sequence_id",
+        "step",
+      ] as const;
+
+      for (const field of metaFields) {
+        const fieldValue = pack.meta[field];
+        if (fieldValue !== undefined && typeof fieldValue !== "string") {
+          return null;
+        }
+      }
+
+      if (pack.meta.policy_map_ids !== undefined) {
+        if (
+          !Array.isArray(pack.meta.policy_map_ids) ||
+          pack.meta.policy_map_ids.some((v) => typeof v !== "string")
+        ) {
+          return null;
+        }
+      }
+
+      meta = {
+        action_type: pack.meta.action_type,
+        function: pack.meta.function,
+        model_id: pack.meta.model_id,
+        sequence_id: pack.meta.sequence_id,
+        step: pack.meta.step,
+        policy_map_ids: pack.meta.policy_map_ids,
+      };
+    }
+
+    // Top-level optional fields
+    if (value.pack_id !== undefined) {
+      if (typeof value.pack_id !== "string") return null;
+      pack_id = value.pack_id;
+    }
+    if (value.key_id !== undefined) {
+      if (typeof value.key_id !== "string") return null;
+      key_id = value.key_id;
+    }
+    if (value.signature !== undefined) {
+      if (typeof value.signature !== "string") return null;
+      signature = value.signature;
+    }
+    if (value.signature_alg !== undefined) {
+      if (typeof value.signature_alg !== "string") return null;
+      signature_alg = value.signature_alg;
+    }
+    if (value.payload_hash !== undefined) {
+      if (typeof value.payload_hash !== "string") return null;
+      payload_hash = value.payload_hash;
+    }
+    if (value.prev_receipt_id !== undefined) {
+      if (typeof value.prev_receipt_id !== "string") return null;
+      prev_receipt_id = value.prev_receipt_id;
+    }
+    if (value.ts_ms !== undefined) {
+      if (typeof value.ts_ms !== "number") return null;
+      ts_ms = value.ts_ms;
+    }
+    if (value.version !== undefined) {
+      if (typeof value.version !== "string") return null;
+      version = value.version;
+    }
+  } else {
+    // Legacy shape
+    rawDecision = value.decision ?? value.status;
+
+    if (value.reasons !== undefined) {
+      if (
+        !Array.isArray(value.reasons) ||
+        value.reasons.some((v) => typeof v !== "string")
+      ) {
+        return null;
+      }
+      reasons = value.reasons;
+    } else {
+      const derivedReasons: string[] = [];
+      if (typeof value.reason_code === "string") {
+        derivedReasons.push(value.reason_code);
+      }
+      if (typeof value.reason_detail === "string") {
+        derivedReasons.push(value.reason_detail);
+      }
+      if (derivedReasons.length > 0) {
+        reasons = derivedReasons;
+      }
+    }
+
+    if (value.meta !== undefined) {
+      if (!isPlainObject(value.meta)) return null;
+
+      const metaFields = [
+        "action_type",
+        "function",
+        "model_id",
+        "sequence_id",
+        "step",
+      ] as const;
+
+      for (const field of metaFields) {
+        const fieldValue = value.meta[field];
+        if (fieldValue !== undefined && typeof fieldValue !== "string") {
+          return null;
+        }
+      }
+
+      if (value.meta.policy_map_ids !== undefined) {
+        if (
+          !Array.isArray(value.meta.policy_map_ids) ||
+          value.meta.policy_map_ids.some((v) => typeof v !== "string")
+        ) {
+          return null;
+        }
+      }
+
+      meta = {
+        action_type: value.meta.action_type,
+        function: value.meta.function,
+        model_id: value.meta.model_id,
+        sequence_id: value.meta.sequence_id,
+        step: value.meta.step,
+        policy_map_ids: value.meta.policy_map_ids,
+      };
+    }
+
+    const optionalStringFields = [
+      "pack_id",
+      "key_id",
+      "signature",
+      "signature_alg",
+      "payload_hash",
+      "prev_receipt_id",
+      "version",
+    ] as const;
+
+    for (const field of optionalStringFields) {
+      const fieldValue = (value as Record<string, unknown>)[field];
       if (fieldValue !== undefined && typeof fieldValue !== "string") {
         return null;
       }
     }
 
-    if (value.meta.policy_map_ids !== undefined) {
-      if (
-        !Array.isArray(value.meta.policy_map_ids) ||
-        value.meta.policy_map_ids.some((v) => typeof v !== "string")
-      ) {
-        return null;
-      }
-    }
-  }
-
-  const optionalStringFields = [
-    "pack_id",
-    "key_id",
-    "signature",
-    "signature_alg",
-    "payload_hash",
-    "prev_receipt_id",
-    "version",
-  ] as const;
-
-  for (const field of optionalStringFields) {
-    const fieldValue = value[field];
-    if (fieldValue !== undefined && typeof fieldValue !== "string") {
+    if (value.executed !== undefined && typeof value.executed !== "boolean") {
       return null;
     }
+
+    if (value.ts_ms !== undefined && typeof value.ts_ms !== "number") {
+      return null;
+    }
+
+    pack_id = typeof value.pack_id === "string" ? value.pack_id : undefined;
+    key_id = typeof value.key_id === "string" ? value.key_id : undefined;
+    signature = typeof value.signature === "string" ? value.signature : undefined;
+    signature_alg =
+      typeof value.signature_alg === "string" ? value.signature_alg : undefined;
+    payload_hash =
+      typeof value.payload_hash === "string" ? value.payload_hash : undefined;
+    prev_receipt_id =
+      typeof value.prev_receipt_id === "string"
+        ? value.prev_receipt_id
+        : undefined;
+    ts_ms = typeof value.ts_ms === "number" ? value.ts_ms : undefined;
+    version = typeof value.version === "string" ? value.version : undefined;
+    executed =
+      typeof value.executed === "boolean" ? value.executed : undefined;
   }
 
-  if (value.executed !== undefined && typeof value.executed !== "boolean") {
+  // Validate decision (common for both shapes)
+  if (
+    rawDecision !== "ALLOW" &&
+    rawDecision !== "DENY" &&
+    rawDecision !== "HALT"
+  ) {
     return null;
   }
 
-  if (value.ts_ms !== undefined && typeof value.ts_ms !== "number") {
-    return null;
-  }
-
-  return value as RailResponse;
+  return {
+    decision: rawDecision as "ALLOW" | "DENY" | "HALT",
+    executed,
+    reasons,
+    meta,
+    pack_id,
+    key_id,
+    signature,
+    signature_alg,
+    payload_hash,
+    prev_receipt_id,
+    ts_ms,
+    version,
+  };
 }
 
 async function verifyRailReceipt(
@@ -605,13 +879,11 @@ async function verifyRailReceipt(
   }
 }
 
-function buildSignedReceiptPayload(railJson: RailResponse): Record<string, unknown> {
-  // Spread passes all fields through — if RailResponse gains new fields,
-  // they must also be present on the rail's signing payload or verification breaks.
-  const {
-    signature: _signature,
-    ...rest
-  } = railJson as RailResponse & Record<string, unknown>;
+function buildSignedReceiptPayload(
+  railJson: RailResponse,
+): Record<string, unknown> {
+  const { signature: _signature, ...rest } =
+    railJson as RailResponse & Record<string, unknown>;
 
   return rest;
 }
@@ -624,7 +896,9 @@ function canonicalJson(value: unknown): string {
   if (value !== null && typeof value === "object") {
     const record = value as Record<string, unknown>;
     const keys = Object.keys(record).sort();
-    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(record[k])}`).join(",")}}`;
+    return `{${keys
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(record[k])}`)
+      .join(",")}}`;
   }
 
   return JSON.stringify(value);
@@ -636,8 +910,7 @@ function base64ToBytes(base64OrUrl: string): Uint8Array {
     .replace(/_/g, "/")
     .replace(/\s+/g, "");
 
-  const padded =
-    normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
 
   const binary = atob(padded);
   const out = new Uint8Array(binary.length);
@@ -651,10 +924,7 @@ function base64ToBytes(base64OrUrl: string): Uint8Array {
 
 function buildEd25519SpkiFromRaw(rawKey: Uint8Array): ArrayBuffer {
   const prefix = new Uint8Array([
-    0x30, 0x2a,
-    0x30, 0x05,
-    0x06, 0x03, 0x2b, 0x65, 0x70,
-    0x03, 0x21, 0x00,
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
   ]);
 
   const out = new Uint8Array(prefix.length + rawKey.length);
@@ -663,19 +933,12 @@ function buildEd25519SpkiFromRaw(rawKey: Uint8Array): ArrayBuffer {
   return out.buffer;
 }
 
-async function safeJson<T>(res: Response): Promise<T | null> {
-  try {
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  }
-}
-
 function jsonResponse(status: number, data: unknown): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*",
     },
   });
 }
@@ -740,62 +1003,277 @@ async function logUsage(
     .run();
 }
 
-async function runExecutor(payload: RailRequest): Promise<ExecutorResult> {
-  switch (payload.action_type) {
-    case "SUBMIT_PAYMENT":
-      return submitPayment(payload.inputs);
+// ── Executor context ──────────────────────────────────────────────────────────
 
-    case "SEND_EMAIL":
-      return sendEmail(payload.inputs);
+type ExecutorContext = {
+  payload: RailRequest;
+  packId: string;
+  env: Env;
+};
 
-    default:
-      return {
-        status: "skipped",
-        message: `No executor wired for action_type=${payload.action_type}`,
-      };
+// ── Idempotency check ─────────────────────────────────────────────────────────
+
+async function getExistingExecution(
+  packId: string,
+  env: Env,
+): Promise<ExecutorResult | null> {
+  if (!packId || !env.DB) return null;
+  try {
+    const row = await env.DB
+      .prepare(
+        "SELECT status, result_json FROM execution_log WHERE pack_id = ? LIMIT 1",
+      )
+      .bind(packId)
+      .first<{ status: string; result_json: string | null }>();
+
+    if (!row) return null;
+
+    const data = row.result_json
+      ? (JSON.parse(row.result_json) as Record<string, unknown>)
+      : undefined;
+
+    return {
+      status: row.status as "submitted" | "failed",
+      data,
+      idempotent: true,
+    };
+  } catch {
+    return null;
   }
 }
 
-async function submitPayment(
-  inputs: Record<string, unknown>,
-): Promise<ExecutorResult> {
-  const amount = Number(inputs.amount ?? 0);
-  const to = String(inputs.to ?? "").trim();
+// ── Execution log write ───────────────────────────────────────────────────────
 
-  if (!Number.isFinite(amount) || amount <= 0 || !to) {
+async function writeExecutionLog(
+  ctx: ExecutorContext,
+  status: "ok" | "failed",
+  result: Record<string, unknown>,
+): Promise<string> {
+  const exec_id = crypto.randomUUID();
+  await ctx.env.DB
+    .prepare(
+      `INSERT INTO execution_log
+         (exec_id, pack_id, sequence_id, step, action_type, status, result_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      exec_id,
+      ctx.packId,
+      ctx.payload.sequence_id,
+      ctx.payload.step,
+      ctx.payload.action_type,
+      status,
+      JSON.stringify(result),
+      new Date().toISOString(),
+    )
+    .run();
+  return exec_id;
+}
+
+// ── Handler: RECORD_RESULT ────────────────────────────────────────────────────
+
+async function handleRecordResult(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const result = ctx.payload.inputs.result;
+  if (result === undefined) {
     return {
       status: "failed",
-      message: "Missing or invalid amount or destination",
+      message: "inputs.result is required for RECORD_RESULT",
     };
   }
+  const exec_id = await writeExecutionLog(ctx, "ok", { result });
+  return { status: "submitted", exec_id, data: { result } };
+}
 
-  console.log("SUBMIT_PAYMENT", { amount, to });
+// ── Handler: CHECK_STATE ──────────────────────────────────────────────────────
+
+async function handleCheckState(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.env.DB) {
+    return { status: "skipped", message: "DB not bound" };
+  }
+  const row = await ctx.env.DB
+    .prepare(
+      "SELECT state_json FROM sequence_state WHERE sequence_id = ? LIMIT 1",
+    )
+    .bind(ctx.payload.sequence_id)
+    .first<{ state_json: string }>();
+
+  const state = row?.state_json
+    ? (JSON.parse(row.state_json) as Record<string, unknown>)
+    : null;
+
+  return { status: "submitted", data: { state } };
+}
+
+// ── Step-order spines (used by CLARIFY_NEXT_STEP and model_id isolation) ─────
+
+const MSMD_STEPS = [
+  "intake", "disruption", "instability", "state_read",
+  "internal_driver", "execution", "boundary", "settle",
+] as const;
+
+const HOKIANGA_STEPS = [
+  "dialect_request", "hapuu_identity", "corpus_query", "provenance_token",
+  "compression_check", "kaitiaki_gate", "output_authorised", "settle",
+] as const;
+
+// Returns the spine for a given step name. Falls back to "msmd" for any step
+// not explicitly listed in a known non-MSMD spine.
+function detectSpine(step: string): "hokianga" | "msmd" {
+  // "settle" appears in both spines — the MSMD check wins, which is correct
+  // for MSMD sequences. Hokianga sequences are identified by their earlier steps.
+  if ((HOKIANGA_STEPS as readonly string[]).includes(step) &&
+      !(MSMD_STEPS as readonly string[]).includes(step)) {
+    return "hokianga";
+  }
+  return "msmd";
+}
+
+// ── sequence_state upsert ─────────────────────────────────────────────────────
+
+async function upsertSequenceState(
+  ctx: ExecutorContext,
+  state: Record<string, unknown>,
+): Promise<void> {
+  await ctx.env.DB
+    .prepare(
+      `INSERT INTO sequence_state (sequence_id, state_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(sequence_id) DO UPDATE
+         SET state_json = excluded.state_json,
+             updated_at = excluded.updated_at`,
+    )
+    .bind(ctx.payload.sequence_id, JSON.stringify(state), new Date().toISOString())
+    .run();
+}
+
+// ── Handler: VALIDATE_INPUT ───────────────────────────────────────────────────
+
+async function handleValidateInput(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const inputs = ctx.payload.inputs;
+  const userKeys = Object.keys(inputs).filter((k) => !k.startsWith("_"));
+  const valid = userKeys.length > 0;
+  const result = valid
+    ? { valid: true, field_count: userKeys.length }
+    : { valid: false, errors: ["inputs contains no user-supplied fields"] };
+  const exec_id = await writeExecutionLog(ctx, "ok", result);
+  return { status: "submitted", exec_id, data: result };
+}
+
+// ── Handler: CLARIFY_NEXT_STEP ────────────────────────────────────────────────
+// Pure read — derives next recommended step from execution_log. No write.
+// Spine is selected from the current payload step so that Hokianga sequences
+// get Hokianga step guidance and MSMD sequences get MSMD step guidance.
+
+async function handleClarifyNextStep(ctx: ExecutorContext): Promise<ExecutorResult> {
+  if (!ctx.env.DB) {
+    return { status: "skipped", message: "DB not bound" };
+  }
+
+  const activeSpine: readonly string[] =
+    detectSpine(ctx.payload.step) === "hokianga" ? HOKIANGA_STEPS : MSMD_STEPS;
+
+  const row = await ctx.env.DB
+    .prepare(
+      `SELECT step FROM execution_log
+       WHERE sequence_id = ? AND status = 'ok'
+       ORDER BY created_at DESC LIMIT 1`,
+    )
+    .bind(ctx.payload.sequence_id)
+    .first<{ step: string }>();
+
+  const currentStep = row?.step ?? null;
+  const currentIndex = currentStep ? activeSpine.indexOf(currentStep) : -1;
+  const nextIndex = currentIndex + 1;
+  const nextStep = nextIndex < activeSpine.length ? activeSpine[nextIndex] : null;
 
   return {
     status: "submitted",
-    message: "Mock payment submitted",
-    data: { amount, to },
+    data: { current_step: currentStep, current_index: currentIndex, next_step: nextStep },
   };
 }
 
-async function sendEmail(
-  inputs: Record<string, unknown>,
-): Promise<ExecutorResult> {
-  const to = String(inputs.to ?? "").trim();
-  const subject = String(inputs.subject ?? "").trim();
+// ── Handler: SELECT_NEXT_STEP ─────────────────────────────────────────────────
 
-  if (!to || !subject) {
-    return {
-      status: "failed",
-      message: "Missing to or subject",
-    };
+async function handleSelectNextStep(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const nextStep = ctx.payload.inputs.next_step;
+  if (typeof nextStep !== "string" || !nextStep.trim()) {
+    return { status: "failed", message: "inputs.next_step is required for SELECT_NEXT_STEP" };
   }
+  const state = { selected_step: nextStep.trim(), selected_at: Date.now() };
+  await upsertSequenceState(ctx, state);
+  const exec_id = await writeExecutionLog(ctx, "ok", state);
+  return { status: "submitted", exec_id, data: state };
+}
 
-  console.log("SEND_EMAIL", { to, subject });
+// ── Handler: WAIT_FOR_SIGNAL ──────────────────────────────────────────────────
 
-  return {
-    status: "submitted",
-    message: "Mock email submitted",
-    data: { to, subject },
-  };
+async function handleWaitForSignal(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const signalKey = typeof ctx.payload.inputs.signal_key === "string"
+    ? ctx.payload.inputs.signal_key.trim()
+    : `signal:${ctx.payload.sequence_id}:${ctx.payload.step}`;
+  const state = { status: "waiting", signal_key: signalKey, waiting_since: Date.now() };
+  await upsertSequenceState(ctx, state);
+  const exec_id = await writeExecutionLog(ctx, "ok", state);
+  return { status: "submitted", exec_id, data: state };
+}
+
+// ── Handler: PAUSE_CYCLE ──────────────────────────────────────────────────────
+
+async function handlePauseCycle(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const state = { status: "paused", paused_at: Date.now() };
+  await upsertSequenceState(ctx, state);
+  const exec_id = await writeExecutionLog(ctx, "ok", state);
+  return { status: "submitted", exec_id, data: state };
+}
+
+// ── Handler: REDUCE_STIMULUS ──────────────────────────────────────────────────
+
+async function handleReduceStimulus(ctx: ExecutorContext): Promise<ExecutorResult> {
+  const cooldownMs = typeof ctx.payload.inputs.cooldown_ms === "number"
+    ? Math.max(0, ctx.payload.inputs.cooldown_ms)
+    : 5000;
+  const until_ms = Date.now() + cooldownMs;
+  const state = { status: "cooldown", cooldown_ms: cooldownMs, until_ms };
+  await upsertSequenceState(ctx, state);
+  const exec_id = await writeExecutionLog(ctx, "ok", state);
+  return { status: "submitted", exec_id, data: state };
+}
+
+// ── runExecutor ───────────────────────────────────────────────────────────────
+
+async function runExecutor(
+  payload: RailRequest,
+  packId: string,
+  env: Env,
+): Promise<ExecutorResult> {
+  const existing = await getExistingExecution(packId, env);
+  if (existing) return existing;
+
+  const ctx: ExecutorContext = { payload, packId, env };
+
+  try {
+    switch (payload.action_type) {
+      case "RECORD_RESULT":       return await handleRecordResult(ctx);
+      case "CHECK_STATE":         return await handleCheckState(ctx);
+      case "VALIDATE_INPUT":      return await handleValidateInput(ctx);
+      case "CLARIFY_NEXT_STEP":   return await handleClarifyNextStep(ctx);
+      case "SELECT_NEXT_STEP":    return await handleSelectNextStep(ctx);
+      case "WAIT_FOR_SIGNAL":     return await handleWaitForSignal(ctx);
+      case "PAUSE_CYCLE":         return await handlePauseCycle(ctx);
+      case "REDUCE_STIMULUS":     return await handleReduceStimulus(ctx);
+      default:
+        return {
+          status: "skipped",
+          message: `No executor wired for action_type=${payload.action_type}`,
+        };
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "executor_error";
+    console.error("runExecutor failed", {
+      action_type: payload.action_type,
+      pack_id: packId,
+      message,
+    });
+    return { status: "failed", message };
+  }
 }

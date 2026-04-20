@@ -1,23 +1,19 @@
-﻿README.md
 # AgenticRail Wrapper
 
-Thin wrapper in front of AgenticRail.
+Front-door Worker for AgenticRail. Handles auth, request normalisation, executor, and usage logging.
 
-## What it is
+## Flow
 
-This service sits between the client and the rail.
-
-Flow:
-
-Client  
-→ Wrapper  
-→ AgenticRail Gate  
-→ AgenticRail Core  
-→ ALLOW / DENY / HALT + signed receipt  
-→ Wrapper executor (only if ALLOW)
-
-The wrapper is the front door.  
-The rail remains the enforcement engine.
+```
+Client (Bearer token)
+  → POST /v1/evaluate
+  → Wrapper: auth + normalise + forward
+  → Gate Worker (x-slp8-key injected by wrapper)
+  → Core Worker (internal binding)
+  → ALLOW / DENY / HALT + signed receipt
+  → Wrapper executor (ALLOW only) → D1 execution_log
+  → Client response
+```
 
 ## Routes
 
@@ -26,162 +22,88 @@ The rail remains the enforcement engine.
 
 ## What it does
 
-- checks bearer auth
-- validates external request shape
-- normalises external requests into rail payloads
-- calls AgenticRail
-- checks returned function / action_type on ALLOW
-- if decision = ALLOW, triggers thin executor
-- logs usage to D1
-- returns clean client-facing response
+1. Authenticates Bearer token against D1 `api_keys` table
+2. Validates external request shape
+3. Normalises into rail payload (adds `schema_version`, `model_id`, `function`, `nonce`, `ts_ms`)
+4. Calls AgenticRail gate
+5. On ALLOW: triggers executor, writes `execution_log` + `sequence_state` to D1
+6. Logs usage to D1 `usage_logs`
+7. Returns flat client-facing response
 
-## Auth modes
+## Executor coverage
 
-### 1. DB-backed API keys (preferred)
+All 8 MSMD canonical action_types are handled:
 
-The wrapper looks up the presented API key in D1.
+| action_type | Behaviour |
+|---|---|
+| `RECORD_RESULT` | Writes result to `execution_log` |
+| `CHECK_STATE` | Reads `sequence_state` (no write) |
+| `VALIDATE_INPUT` | Counts and validates input keys |
+| `CLARIFY_NEXT_STEP` | Derives next step from MSMD order |
+| `SELECT_NEXT_STEP` | Writes `next_step` to `sequence_state` |
+| `WAIT_FOR_SIGNAL` | Writes `waiting` status + signal key |
+| `PAUSE_CYCLE` | Writes `paused` status + timestamp |
+| `REDUCE_STIMULUS` | Writes `cooldown` state |
 
-Expected key shape:
+Idempotency: each execution keyed on `pack_id` (UNIQUE in `execution_log`). Duplicate requests return cached result.
 
-```text
-ar_live_TEST.abc123secret
-prefix = ar_live_TEST
-full key is hashed with SHA-256
-only hash is stored
-key status must be active
-client status must be active
-2. Shared secret fallback (temporary only)
+## Auth
 
-WRAPPER_SHARED_SECRET still works as a fallback during transition.
+### D1-backed API keys (primary)
 
-This is only for setup/testing.
-Remove it once D1-backed keys are live.
+Key format: `ar_live_<prefix>.<secret>` — only SHA-256 hash stored.
 
-D1 tables expected
-clients
-CREATE TABLE IF NOT EXISTS clients (
-  client_id TEXT PRIMARY KEY,
-  email TEXT NOT NULL,
-  email_verified INTEGER DEFAULT 0,
-  status TEXT DEFAULT 'active',
-  created_at TEXT
-);
-api_keys
-CREATE TABLE IF NOT EXISTS api_keys (
-  key_id TEXT PRIMARY KEY,
-  client_id TEXT NOT NULL,
-  key_prefix TEXT NOT NULL,
-  key_hash TEXT NOT NULL,
-  mode TEXT DEFAULT 'live',
-  status TEXT DEFAULT 'active',
-  created_at TEXT,
-  last_used_at TEXT
-);
-usage_logs
-CREATE TABLE IF NOT EXISTS usage_logs (
-  log_id TEXT PRIMARY KEY,
-  client_id TEXT,
-  key_id TEXT,
-  sequence_id TEXT,
-  decision TEXT,
-  created_at TEXT
-);
-External request contract
+### Shared secret fallback
 
-Client sends a simpler request:
+`WRAPPER_SHARED_SECRET` env var — for setup/testing only.
 
+## External request contract
+
+Client sends:
+
+```json
 {
   "sequence_id": "seq_001",
   "step": "execution",
-  "action_type": "SUBMIT_PAYMENT",
-  "action": "submit payment",
-  "inputs": {
-    "amount": 100,
-    "to": "acct_123"
-  }
+  "action_type": "RECORD_RESULT",
+  "action": "record payment result",
+  "inputs": { "result": "payment_complete" }
 }
+```
 
-The wrapper adds:
+Wrapper adds: `schema_version`, `model_id`, `function`, `nonce`, `ts_ms`.
 
-schema_version
-model_id
-function = step
-nonce
-ts_ms
+## Response contract
 
-Then forwards the full payload to the rail.
-
-External response contract
-
-Wrapper returns:
-
+```json
 {
   "decision": "ALLOW",
   "executed": true,
   "reasons": [],
   "sequence_id": "seq_001",
   "step": "execution",
-  "action_type": "SUBMIT_PAYMENT",
-  "result": {
-    "status": "submitted",
-    "message": "Mock payment submitted"
-  },
-  "receipt": {
-    "pack_id": "abc123",
-    "key_id": "k1_2026-02-22_01",
-    "signature": "...",
-    "signature_alg": "Ed25519",
-    "payload_hash": "...",
-    "prev_receipt_id": "...",
-    "ts_ms": 1712830000000,
-    "version": "slp8_receipt_v2"
-  }
+  "action_type": "RECORD_RESULT",
+  "result": { "status": "recorded", "exec_id": "..." },
+  "receipt": { "pack_id": "...", "signature": "...", "version": "slp8_receipt_v2" }
 }
-Executor rule
+```
 
-The rail does not perform real-world actions directly.
+## D1 schema
 
-It only decides:
+See `schema.sql`. Tables: `clients`, `api_keys`, `usage_logs`, `execution_log`, `sequence_state`.
 
-ALLOW
-DENY
-HALT
+## Deploy
 
-If the decision is ALLOW, the wrapper may trigger an executor.
+```bash
+cd agenticrail-wrapper
+# Edit wrangler.toml: paste real database_id
+npx wrangler deploy
+```
 
-Current mock executors:
+Seed with `schema.sql` + `seed.sql` for API key rows.
 
-SUBMIT_PAYMENT
-SEND_EMAIL
-Run
-Edit wrangler.toml
-Paste the real database_id
-Set RAIL_URL
-Optionally set WRAPPER_SHARED_SECRET during transition
-Run:
-wrangler dev
+## Principles
 
-or deploy:
-
-wrangler deploy
-Minimum manual setup still required
-1. Paste the D1 database ID
-
-In wrangler.toml:
-
-database_id = "PASTE_DB_ID_HERE"
-2. Insert at least one client row
-3. Insert at least one API key row
-
-The wrapper cannot authenticate against D1 until real rows exist.
-
-Notes
-Keep this separate from the rail repo
-Wrapper = front door
-Rail = enforcement engine
-DB-backed keys are the target
-Shared secret is temporary only
-Keep the wrapper thin
-Do not move enforcement logic out of the rail
-
-Current source files referenced: :contentReference[oaicite:0]{index=0} :contentReference[oaicite:1]{index=1}
+- Wrapper = front door only
+- Enforcement logic stays in the rail (gate + core)
+- Never move policy or DO state here

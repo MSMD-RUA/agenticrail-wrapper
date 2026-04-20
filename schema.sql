@@ -44,3 +44,26 @@ ON usage_logs(sequence_id);
 
 CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at
 ON usage_logs(created_at);
+
+CREATE TABLE IF NOT EXISTS execution_log (
+  exec_id     TEXT NOT NULL PRIMARY KEY,
+  pack_id     TEXT NOT NULL UNIQUE,
+  sequence_id TEXT NOT NULL,
+  step        TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  status      TEXT NOT NULL,
+  result_json TEXT,
+  created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_log_sequence_id
+ON execution_log(sequence_id);
+
+CREATE INDEX IF NOT EXISTS idx_execution_log_pack_id
+ON execution_log(pack_id);
+
+CREATE TABLE IF NOT EXISTS sequence_state (
+  sequence_id TEXT NOT NULL PRIMARY KEY,
+  state_json  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
