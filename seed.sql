@@ -1,4 +1,14 @@
-﻿INSERT INTO clients (
+-- Development seed — ONE ROW PER TABLE.
+-- This file is for local setup and CI only. Never run against production.
+--
+-- Test API key (full key, for use in Authorization header):
+--   ar_live_DEMO1.dev_only_seed_key_not_for_production
+--
+-- key_hash = SHA-256(full key above) using UTF-8 encoding.
+-- Recompute if you change the key:
+--   echo -n "ar_live_DEMO1.dev_only_seed_key_not_for_production" | sha256sum
+
+INSERT INTO clients (
   client_id,
   email,
   email_verified,
@@ -25,7 +35,7 @@ INSERT INTO api_keys (
   'key_demo_001',
   'cli_demo_001',
   'ar_live_DEMO1',
-  'PASTE_REAL_SHA256_OF_FULL_KEY_HERE',
+  'aa68d23870b43636cf946453666f872125ec8759efbec046b29888b850b44221',
   'live',
   'active',
   '2026-04-14T10:30:00+12:00',

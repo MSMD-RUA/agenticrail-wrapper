@@ -5,6 +5,7 @@ export interface Env {
   DEMO_KEY?: string;
   DB: D1Database;
   RATE_LIMITER: DurableObjectNamespace;
+  CORS_ALLOW_ORIGIN?: string;
 }
 
 // ── Global Durable Object rate limiter ───────────────────────────────────────
@@ -41,15 +42,16 @@ async function rateLimitOk(ns: DurableObjectNamespace, key: string, limitPerMin:
     });
     const data = await res.json<{ ok: boolean }>();
     return data.ok;
-  } catch {
-    // If DO is unavailable, fail open (don't block traffic on rate-limiter outage)
+  } catch (e) {
+    // DO unavailable — fail open to preserve availability; log so outages are visible
+    console.warn("rate_limiter_unavailable", { key, error: e instanceof Error ? e.message : String(e) });
     return true;
   }
 }
 
 // Convenience wrappers
-async function demoRateLimitOk(ns: DurableObjectNamespace, ip: string): Promise<boolean>    { return rateLimitOk(ns, `demo:${ip}`, 60); }
-async function prodRateLimitOk(ns: DurableObjectNamespace, keyId: string): Promise<boolean> { return rateLimitOk(ns, `prod:${keyId}`, 300); }
+async function demoRateLimitOk(ns: DurableObjectNamespace, ip: string): Promise<boolean>    { return rateLimitOk(ns, `demo:${ip}`, 300); }
+async function prodRateLimitOk(ns: DurableObjectNamespace, keyId: string): Promise<boolean> { return rateLimitOk(ns, `prod:${keyId}`, 3000); }
 
 type ExternalEvaluateRequest = {
   sequence_id: string;
@@ -59,6 +61,8 @@ type ExternalEvaluateRequest = {
   action?: string;
   inputs?: Record<string, unknown>;
   nonce?: string;
+  spine?: "msmd" | "hokianga";
+  step_order?: string[];
 };
 
 type RailRequest = {
@@ -72,6 +76,7 @@ type RailRequest = {
   ts_ms: number;
   action: string;
   inputs: Record<string, unknown>;
+  step_order?: string[];
 };
 
 type RailResponse = {
@@ -129,12 +134,13 @@ type AuthFailure = {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const corsOrigin = env.CORS_ALLOW_ORIGIN || "*";
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: {
-          "access-control-allow-origin": "*",
+          "access-control-allow-origin": corsOrigin,
           "access-control-allow-methods": "POST, GET, OPTIONS",
           "access-control-allow-headers": "content-type, authorization",
           "access-control-max-age": "86400",
@@ -147,7 +153,7 @@ export default {
         ok: true,
         service: "agenticrail-wrapper",
         now: Date.now(),
-      });
+      }, corsOrigin);
     }
 
     if (request.method === "POST" && url.pathname === "/v1/evaluate") {
@@ -159,7 +165,7 @@ export default {
           return jsonResponse(401, {
             error: "missing_bearer_token",
             message: "Authorization: Bearer <token> required",
-          });
+          }, corsOrigin);
         }
 
         // Demo key bypass — no D1 lookup, fixed auth result
@@ -167,7 +173,7 @@ export default {
         if (env.DEMO_KEY && token === env.DEMO_KEY) {
           const ip = request.headers.get("cf-connecting-ip") || "demo";
           if (env.RATE_LIMITER && !await demoRateLimitOk(env.RATE_LIMITER, ip)) {
-            return jsonResponse(429, { error: "rate_limited", message: "Demo limit: 60 req/min per IP" });
+            return jsonResponse(429, { error: "rate_limited", message: "Demo limit: 60 req/min per IP" }, corsOrigin);
           }
           authResult = { ok: true, keyId: "key_demo", clientId: "demo" };
         } else {
@@ -177,12 +183,21 @@ export default {
           return jsonResponse(authResult.status, {
             error: authResult.error,
             message: authResult.message,
-          });
+          }, corsOrigin);
         }
 
         // Production key rate limit (300 req/min per key_id — globally enforced via DO)
         if (authResult.clientId !== "demo" && env.RATE_LIMITER && !await prodRateLimitOk(env.RATE_LIMITER, authResult.keyId)) {
-          return jsonResponse(429, { error: "rate_limited", message: "Rate limit: 300 req/min per key" });
+          return jsonResponse(429, { error: "rate_limited", message: "Rate limit: 300 req/min per key" }, corsOrigin);
+        }
+
+        // Rail config check: production requests need RAIL_SHARED_SECRET.
+        // Without it, the gate rejects with 401. Routing uses the RAIL service binding — no endpoint URL needed.
+        if (authResult.clientId !== "demo" && !env.RAIL_SHARED_SECRET) {
+          return jsonResponse(500, {
+            error: "rail_not_configured",
+            message: "RAIL_SHARED_SECRET is not configured. Set this environment variable to the Gate's API key.",
+          }, corsOrigin);
         }
 
         const parsedBody =
@@ -191,7 +206,7 @@ export default {
           return jsonResponse(400, {
             error: "invalid_json",
             message: parsedBody.message,
-          });
+          }, corsOrigin);
         }
 
         const body = parsedBody.data;
@@ -200,7 +215,7 @@ export default {
           return jsonResponse(400, {
             error: "invalid_request",
             message: validationError,
-          });
+          }, corsOrigin);
         }
 
         const ext = normalizeExternalRequest(body as ExternalEvaluateRequest);
@@ -211,15 +226,15 @@ export default {
           ext.sequence_id = "demo-" + ext.sequence_id;
         }
 
-        // DO isolation: prefix model_id by spine so that Hokianga and MSMD
-        // sequences never share a Durable Object even when they share a client_id.
-        // "settle" exists in both spines — detectSpine() returns "msmd" for it,
-        // which is correct: a settle step in a Hokianga sequence will have arrived
-        // here after earlier Hokianga steps already stamped the hokianga: prefix.
-        // The DO isolation key is model_id::sequence_id, so the prefix is sticky
-        // only for the first step. Subsequent steps must use the same sequence_id
-        // to hit the same DO — which they will, by the enforcement contract.
-        const spine = detectSpine(ext.step);
+        // DO isolation: model_id is prefixed by spine so Hokianga and MSMD
+        // sequences never share a Durable Object (core keys the DO as
+        // `${model_id}::${sequence_id}`, recomputed on every request).
+        // "settle" appears in both spines — callers in a Hokianga sequence
+        // MUST pass spine: "hokianga" so the settle step hits the same DO
+        // as the preceding Hokianga steps. Without it, detectSpine("settle")
+        // falls back to "msmd" and the final step lands on a different DO,
+        // producing a guaranteed SEQUENCE_VIOLATION.
+        const spine = ext.spine ?? detectSpine(ext.step);
         const modelIdPrefix = spine === "hokianga" ? "hokianga" : "client";
 
         const railPayload: RailRequest = {
@@ -233,6 +248,7 @@ export default {
           ts_ms: Date.now(),
           action: ext.action ?? `run ${ext.function ?? ext.step}`,
           inputs: ext.inputs ?? {},
+          step_order: ext.step_order,
         };
 
         const railHeaders: Record<string, string> = {
@@ -266,7 +282,7 @@ export default {
           return jsonResponse(502, {
             error: "rail_unavailable",
             message: "Rail did not return a valid response",
-          });
+          }, corsOrigin);
         }
 
         if (env.RAIL_PUBLIC_KEY) {
@@ -275,7 +291,7 @@ export default {
               error: "rail_signature_missing",
               message:
                 "RAIL_PUBLIC_KEY is configured but rail returned no signature",
-            });
+            }, corsOrigin);
           }
 
           const verified = await verifyRailReceipt(
@@ -286,7 +302,7 @@ export default {
             return jsonResponse(502, {
               error: "rail_signature_invalid",
               message: "Rail response signature failed verification",
-            });
+            }, corsOrigin);
           }
         }
 
@@ -325,7 +341,7 @@ export default {
               sequence_id: returnedSequenceId ?? null,
               step: returnedStep ?? null,
             },
-          });
+          }, corsOrigin);
         }
 
         if (
@@ -353,7 +369,7 @@ export default {
         };
 
         if (railJson.decision === "ALLOW") {
-          executorResult = await runExecutor(railPayload, railJson.pack_id ?? "", env);
+          executorResult = await runExecutor(railPayload, railJson.pack_id ?? "", env, spine);
         }
 
         const wrapperExecuted = executorResult.status === "submitted";
@@ -392,21 +408,38 @@ export default {
             ok: logResult.ok,
             error: logResult.ok ? null : "usage_log_failed",
           },
-        });
+        }, corsOrigin);
       } catch (err) {
         const message =
           err instanceof Error ? err.message : "Unknown wrapper error";
         return jsonResponse(500, {
           error: "wrapper_error",
           message,
-        });
+        }, corsOrigin);
       }
     }
 
     return jsonResponse(404, {
       error: "not_found",
       message: "Route not found",
-    });
+    }, corsOrigin);
+  },
+
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    const cutoff90d = new Date(event.scheduledTime - 90 * 24 * 60 * 60 * 1000).toISOString();
+    const cutoff30d = new Date(event.scheduledTime - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const results = await Promise.allSettled([
+      env.DB.prepare("DELETE FROM usage_logs WHERE created_at < ?").bind(cutoff90d).run(),
+      env.DB.prepare("DELETE FROM execution_log WHERE created_at < ?").bind(cutoff90d).run(),
+      env.DB.prepare("DELETE FROM sequence_state WHERE updated_at < ?").bind(cutoff30d).run(),
+    ]);
+    for (const [i, r] of results.entries()) {
+      if (r.status === "rejected") {
+        console.error(`d1_retention_cleanup[${i}] failed`, String(r.reason));
+      } else {
+        console.log(`d1_retention_cleanup[${i}] ok`, { changes: r.value.meta?.changes ?? 0 });
+      }
+    }
   },
 };
 
@@ -577,6 +610,10 @@ function validateExternalRequest(
     return "inputs must be an object if provided";
   }
 
+  if (body.spine !== undefined && body.spine !== "msmd" && body.spine !== "hokianga") {
+    return "spine must be 'msmd' or 'hokianga' if provided";
+  }
+
   return null;
 }
 
@@ -591,6 +628,8 @@ function normalizeExternalRequest(
     action: body.action?.trim(),
     inputs: body.inputs ?? {},
     nonce: body.nonce?.trim(),
+    spine: body.spine,
+    step_order: Array.isArray(body.step_order) ? body.step_order.map(s => String(s).trim()).filter(Boolean) : undefined,
   };
 }
 
@@ -933,12 +972,12 @@ function buildEd25519SpkiFromRaw(rawKey: Uint8Array): ArrayBuffer {
   return out.buffer;
 }
 
-function jsonResponse(status: number, data: unknown): Response {
+function jsonResponse(status: number, data: unknown, corsOrigin = "*"): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*",
+      "access-control-allow-origin": corsOrigin,
     },
   });
 }
@@ -1009,6 +1048,7 @@ type ExecutorContext = {
   payload: RailRequest;
   packId: string;
   env: Env;
+  spine: "msmd" | "hokianga";
 };
 
 // ── Idempotency check ─────────────────────────────────────────────────────────
@@ -1170,7 +1210,7 @@ async function handleClarifyNextStep(ctx: ExecutorContext): Promise<ExecutorResu
   }
 
   const activeSpine: readonly string[] =
-    detectSpine(ctx.payload.step) === "hokianga" ? HOKIANGA_STEPS : MSMD_STEPS;
+    ctx.spine === "hokianga" ? HOKIANGA_STEPS : MSMD_STEPS;
 
   const row = await ctx.env.DB
     .prepare(
@@ -1245,11 +1285,12 @@ async function runExecutor(
   payload: RailRequest,
   packId: string,
   env: Env,
+  spine: "msmd" | "hokianga",
 ): Promise<ExecutorResult> {
   const existing = await getExistingExecution(packId, env);
   if (existing) return existing;
 
-  const ctx: ExecutorContext = { payload, packId, env };
+  const ctx: ExecutorContext = { payload, packId, env, spine };
 
   try {
     switch (payload.action_type) {

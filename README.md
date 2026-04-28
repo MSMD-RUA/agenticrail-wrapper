@@ -55,7 +55,7 @@ Key format: `ar_live_<prefix>.<secret>` — only SHA-256 hash stored.
 
 ### Shared secret fallback
 
-`WRAPPER_SHARED_SECRET` env var — for setup/testing only.
+`RAIL_SHARED_SECRET` env var — for setup/testing only.
 
 ## External request contract
 

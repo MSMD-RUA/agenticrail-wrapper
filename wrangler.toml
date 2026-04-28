@@ -2,6 +2,9 @@
 main = "src/index.ts"
 compatibility_date = "2026-04-17"
 
+[triggers]
+crons = ["0 3 * * *"]
+
 [vars]
 DEMO_KEY = "DEMO-AGENTICRAIL-PUBLIC-2026"
 
