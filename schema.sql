@@ -13,10 +13,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
   key_hash TEXT NOT NULL,
   mode TEXT NOT NULL DEFAULT 'live',
   status TEXT NOT NULL DEFAULT 'active',
+  plan TEXT NOT NULL DEFAULT 'growth',
   created_at TEXT NOT NULL,
   last_used_at TEXT,
   FOREIGN KEY (client_id) REFERENCES clients(client_id)
 );
+
+-- Add plan column if upgrading from older schema
+-- D1 doesn't support ALTER TABLE ADD COLUMN IF NOT EXISTS,
+-- so run this after deploy and ignore the error if it already exists
+-- ALTER TABLE api_keys ADD COLUMN plan TEXT NOT NULL DEFAULT 'growth';
 
 CREATE TABLE IF NOT EXISTS usage_logs (
   log_id TEXT PRIMARY KEY,

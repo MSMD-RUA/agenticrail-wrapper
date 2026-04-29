@@ -6,6 +6,8 @@ export interface Env {
   DB: D1Database;
   RATE_LIMITER: DurableObjectNamespace;
   CORS_ALLOW_ORIGIN?: string;
+  RESEND_API_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 // ── Global Durable Object rate limiter ───────────────────────────────────────
@@ -146,6 +148,44 @@ export default {
           "access-control-max-age": "86400",
         },
       });
+    }
+
+    // ── Stripe webhook ───────────────────────────────────────────────────────
+    if (request.method === "POST" && url.pathname === "/v1/webhooks/stripe") {
+      const sig  = request.headers.get("stripe-signature") || "";
+      const secret = env.STRIPE_WEBHOOK_SECRET || "";
+      if (!secret) return jsonResponse(500, { error: "stripe_not_configured" }, corsOrigin);
+
+      // Verify Stripe signature
+      let event: { type: string; data: { object: Record<string, unknown> } };
+      try {
+        const rawBody = await request.text();
+        event = await verifyStripeSignature(rawBody, sig, secret);
+      } catch {
+        return jsonResponse(400, { error: "invalid_signature" }, corsOrigin);
+      }
+
+      // Handle checkout.session.completed
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const email   = String(session.customer_email || session.customer_details?.email || "");
+        const amount  = Number(session.amount_total || 0) / 100; // cents → dollars
+        const plan    = amount >= 799 ? "scale" : "growth";
+
+        if (email && env.DB && env.RESEND_API_KEY) {
+          try {
+            const { key, keyId } = await createClientAndKey(env, email, plan);
+            await sendWelcomeEmail(env.RESEND_API_KEY, email, key, plan);
+            return jsonResponse(200, { ok: true, key_id: keyId }, corsOrigin);
+          } catch (e) {
+            console.error("stripe_webhook_onboarding_failed", { email, plan, error: String(e) });
+            return jsonResponse(500, { error: "onboarding_failed" }, corsOrigin);
+          }
+        }
+        return jsonResponse(200, { ok: true, note: "Payment received — key generation requires DB and RESEND_API_KEY" }, corsOrigin);
+      }
+
+      return jsonResponse(200, { ok: true, note: `Unhandled event: ${event.type}` }, corsOrigin);
     }
 
     if (request.method === "GET" && url.pathname === "/v1/health") {
@@ -1317,4 +1357,129 @@ async function runExecutor(
     });
     return { status: "failed", message };
   }
+}
+
+// ── Stripe webhook helpers ────────────────────────────────────────────────────
+
+async function verifyStripeSignature(
+  body: string,
+  signature: string,
+  secret: string,
+): Promise<{ type: string; data: { object: Record<string, unknown> } }> {
+  // SubtleCrypto-based HMAC verification for Stripe signatures.
+  // Stripe signatures have format: t=timestamp,v1=sig1,v1=sig2,...
+  const encoder = new TextEncoder();
+
+  // Extract timestamp and signatures
+  const parts: Record<string, string> = {};
+  for (const pair of signature.split(",")) {
+    const [k, v] = pair.split("=");
+    if (k && v) parts[k.trim()] = v.trim();
+  }
+  const timestamp = parts["t"] || "";
+  const sigList   = (parts["v1"] || "").split(" ").filter(Boolean);
+
+  // Must have at least one v1 signature
+  if (!timestamp || sigList.length === 0) {
+    throw new Error("Invalid signature format");
+  }
+
+  // Verify against each provided signature
+  const signedPayload = `${timestamp}.${body}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  let verified = false;
+  for (const sigHex of sigList) {
+    const sigBytes = hexToBytes(sigHex);
+    const ok = await crypto.subtle.verify("HMAC", key, sigBytes, encoder.encode(signedPayload));
+    if (ok) { verified = true; break; }
+  }
+
+  if (!verified) throw new Error("Signature verification failed");
+
+  return JSON.parse(body) as { type: string; data: { object: Record<string, unknown> } };
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+async function createClientAndKey(
+  env: Env,
+  email: string,
+  plan: string,
+): Promise<{ key: string; keyId: string }> {
+  const clientId  = `cli_${crypto.randomUUID().slice(0, 8)}`;
+  const keySecret = crypto.randomUUID().replace(/-/g, "");
+  const keyPrefix = `slp8_${plan}_${crypto.randomUUID().slice(0, 6)}`;
+  const fullKey   = `${keyPrefix}.${keySecret}`;
+  const keyHash   = await sha256Hex(fullKey);
+  const keyId     = `key_${crypto.randomUUID().slice(0, 8)}`;
+  const now       = new Date().toISOString();
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO clients (client_id, email, status, created_at) VALUES (?, ?, 'active', ?)`
+    ).bind(clientId, email, now),
+    env.DB.prepare(
+      `INSERT INTO api_keys (key_id, client_id, key_hash, key_prefix, status, created_at, plan) VALUES (?, ?, ?, ?, 'active', ?, ?)`
+    ).bind(keyId, clientId, keyHash, keyPrefix, now, plan),
+  ]);
+
+  return { key: fullKey, keyId };
+}
+
+async function sendWelcomeEmail(
+  apiKey: string,
+  to: string,
+  clientKey: string,
+  plan: string,
+): Promise<void> {
+  const planName = plan === "scale" ? "Scale ($799/mo)" : "Growth ($299/mo)";
+  const limit    = plan === "scale" ? "30,000 req/min" : "3,000 req/min";
+
+  await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "AgenticRail <hello@agenticrail.nz>",
+      to,
+      subject: `Your AgenticRail API key — ${planName}`,
+      text: [
+        `Welcome to AgenticRail.`,
+        ``,
+        `Your API key:`,
+        `${clientKey}`,
+        ``,
+        `Plan: ${planName}`,
+        `Rate limit: ${limit}`,
+        ``,
+        `Get your first ALLOW in 60 seconds:`,
+        `https://agenticrail.nz/builder/`,
+        ``,
+        `Docs: https://agenticrail.nz/docs`,
+        `Verification: https://report.agenticrail.nz`,
+        ``,
+        `Use this key in your Authorization header:`,
+        `Authorization: Bearer ${clientKey}`,
+        ``,
+        `Questions? Reply to this email or contact hello@agenticrail.nz.`,
+        ``,
+        `— TUARA KURI LIMITED, trading as AgenticRail`,
+        `Hokianga, New Zealand`,
+      ].join("\n"),
+    }),
+  });
 }
