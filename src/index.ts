@@ -53,7 +53,10 @@ async function rateLimitOk(ns: DurableObjectNamespace, key: string, limitPerMin:
 
 // Convenience wrappers
 async function demoRateLimitOk(ns: DurableObjectNamespace, ip: string): Promise<boolean>    { return rateLimitOk(ns, `demo:${ip}`, 300); }
-async function prodRateLimitOk(ns: DurableObjectNamespace, keyId: string): Promise<boolean> { return rateLimitOk(ns, `prod:${keyId}`, 3000); }
+async function prodRateLimitOk(ns: DurableObjectNamespace, keyId: string, plan: string): Promise<boolean> {
+  const limit = plan === "scale" ? 30_000 : 3_000;
+  return rateLimitOk(ns, `prod:${keyId}`, limit);
+}
 
 type ExternalEvaluateRequest = {
   sequence_id: string;
@@ -118,12 +121,14 @@ type ApiKeyRecord = {
   key_prefix: string;
   key_status: string;
   client_status: string;
+  plan: string;
 };
 
 type AuthSuccess = {
   ok: true;
   keyId: string;
   clientId: string;
+  plan: string;
 };
 
 type AuthFailure = {
@@ -215,7 +220,7 @@ export default {
           if (env.RATE_LIMITER && !await demoRateLimitOk(env.RATE_LIMITER, ip)) {
             return jsonResponse(429, { error: "rate_limited", message: "Demo limit: 60 req/min per IP" }, corsOrigin);
           }
-          authResult = { ok: true, keyId: "key_demo", clientId: "demo" };
+          authResult = { ok: true, keyId: "key_demo", clientId: "demo", plan: "demo" };
         } else {
           authResult = await authenticateApiKey(token, env);
         }
@@ -227,7 +232,7 @@ export default {
         }
 
         // Production key rate limit (300 req/min per key_id — globally enforced via DO)
-        if (authResult.clientId !== "demo" && env.RATE_LIMITER && !await prodRateLimitOk(env.RATE_LIMITER, authResult.keyId)) {
+        if (authResult.clientId !== "demo" && env.RATE_LIMITER && !await prodRateLimitOk(env.RATE_LIMITER, authResult.keyId, authResult.plan)) {
           return jsonResponse(429, { error: "rate_limited", message: "Rate limit: 300 req/min per key" }, corsOrigin);
         }
 
@@ -506,6 +511,7 @@ async function authenticateApiKey(
       ak.client_id,
       ak.key_hash,
       ak.key_prefix,
+      ak.plan,
       ak.status AS key_status,
       c.status AS client_status
     FROM api_keys ak
@@ -574,6 +580,7 @@ async function authenticateApiKey(
     ok: true,
     keyId: row.key_id,
     clientId: row.client_id,
+    plan: row.plan || "growth",
   };
 }
 
