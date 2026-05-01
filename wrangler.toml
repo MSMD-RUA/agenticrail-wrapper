@@ -2,6 +2,10 @@
 main = "src/index.ts"
 compatibility_date = "2026-04-17"
 
+[[routes]]
+pattern = "api.agenticrail.nz/*"
+zone_name = "agenticrail.nz"
+
 [triggers]
 crons = ["0 3 * * *"]
 

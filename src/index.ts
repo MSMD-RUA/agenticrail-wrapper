@@ -218,7 +218,7 @@ export default {
         if (env.DEMO_KEY && token === env.DEMO_KEY) {
           const ip = request.headers.get("cf-connecting-ip") || "demo";
           if (env.RATE_LIMITER && !await demoRateLimitOk(env.RATE_LIMITER, ip)) {
-            return jsonResponse(429, { error: "rate_limited", message: "Demo limit: 60 req/min per IP" }, corsOrigin);
+            return jsonResponse(429, { error: "rate_limited", message: "Demo limit: 300 req/min per IP" }, corsOrigin);
           }
           authResult = { ok: true, keyId: "key_demo", clientId: "demo", plan: "demo" };
         } else {
@@ -231,9 +231,10 @@ export default {
           }, corsOrigin);
         }
 
-        // Production key rate limit (300 req/min per key_id — globally enforced via DO)
+        // Production key rate limit (3,000 req/min growth / 30,000 req/min scale — globally enforced via DO)
         if (authResult.clientId !== "demo" && env.RATE_LIMITER && !await prodRateLimitOk(env.RATE_LIMITER, authResult.keyId, authResult.plan)) {
-          return jsonResponse(429, { error: "rate_limited", message: "Rate limit: 300 req/min per key" }, corsOrigin);
+          const rateLimit = authResult.plan === "scale" ? "30,000" : "3,000";
+          return jsonResponse(429, { error: "rate_limited", message: `Rate limit: ${rateLimit} req/min per key` }, corsOrigin);
         }
 
         // Rail config check: production requests need RAIL_SHARED_SECRET.
