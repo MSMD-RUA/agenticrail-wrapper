@@ -323,6 +323,13 @@ export default {
 
         const railJson = parseRailResponse(rawRailJson);
 
+        // Gate HALT responses (poison/schema violation) — pass through as-is.
+        // Without this, any non-2xx from the gate hits the rail_unavailable 502 path.
+        if (!railRes.ok && rawRailJson && typeof rawRailJson === "object" &&
+            (rawRailJson as Record<string, unknown>).status === "HALT") {
+          return jsonResponse(railRes.status as number, rawRailJson, corsOrigin);
+        }
+
         if (!railRes.ok || !railJson) {
           console.warn("rail_unavailable", { status: railRes.status, body: typeof rawRailJson === "string" ? rawRailJson.slice(0, 200) : rawRailJson });
           return jsonResponse(502, {
